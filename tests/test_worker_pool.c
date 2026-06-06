@@ -174,11 +174,14 @@ static void concurrency_worker(int idx, void *ctx_ptr) {
     (void)idx;
     concurrency_ctx_t *cc = ctx_ptr;
     int cur = atomic_fetch_add(&cc->concurrent_now, 1) + 1;
-    /* Brief busy-wait to let others start */
-    volatile int x = 0;
-    for (int j = 0; j < 10000; j++)
-        x++;
-    (void)x;
+    /* Spin until at least two workers are concurrently active, so overlap is
+     * demonstrated deterministically instead of depending on thread-spawn timing
+     * (a fixed busy-wait flaked on loaded runners when a worker finished before
+     * the next started). Bounded so it can't hang if real parallelism is absent. */
+    for (long spins = 0; spins < 200000000L; spins++) {
+        if (atomic_load(&cc->concurrent_now) >= 2 || atomic_load(&cc->concurrent_max) >= 2)
+            break;
+    }
     /* Record max */
     int prev_max = atomic_load(&cc->concurrent_max);
     while (cur > prev_max) {
