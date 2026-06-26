@@ -53,6 +53,8 @@ extern void suite_repro_issue434(void);
 extern void suite_repro_issue471(void);
 extern void suite_repro_issue221(void);
 extern void suite_repro_issue548(void);
+extern void suite_repro_issue363(void);
+extern void suite_repro_issue581(void);
 /* NEW bugs found by the discovery sweep */
 extern void suite_repro_new_ts_class_field_arrow(void);
 extern void suite_repro_new_py_tuple_unpack(void);
@@ -100,6 +102,8 @@ int main(void) {
     RUN_SUITE(repro_new_ts_class_field_arrow);
     RUN_SUITE(repro_new_py_tuple_unpack);
     RUN_SUITE(repro_new_cypher_limit_zero);
+    RUN_SUITE(repro_issue363);
+    RUN_SUITE(repro_issue581);
 
     TEST_SUMMARY();
 }
