@@ -744,9 +744,17 @@ static const char *c_adl_resolve(CLSPContext *ctx, const char *name, TSNode call
             namespaces[ns_count++] = ns;
     }
 
-    // Try each namespace
+    // Try each namespace, then the module-prefixed form of it. An argument type
+    // written as `ns::Data` evaluates to the namespace QN `ns`, but the function
+    // is registered under the module-qualified `<module>.ns.serialize`; without
+    // the module-prefixed retry the namespace-scoped overload is never found.
     for (int i = 0; i < ns_count; i++) {
         const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, namespaces[i], name);
+        if (!f && ctx->module_qn) {
+            const char *prefixed =
+                cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, namespaces[i]);
+            f = cbm_registry_lookup_symbol(ctx->registry, prefixed, name);
+        }
         if (f)
             return f->qualified_name;
     }
@@ -2559,6 +2567,45 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         }
     }
 
+    /* Namespaced-type short-name fallback: a type name that resolves nowhere may
+     * be a type declared inside a namespace whose registered QN carries the
+     * namespace ("<module>.<ns>.Logger"), while the use site only knew the
+     * file-scoped "<module>.Logger" or the bare "Logger" (e.g. the return type of
+     * a namespace-scoped factory used outside that namespace). Resolve by the
+     * SHORT name (last segment) against the registry and retry with the full QN.
+     * Reached only after the direct/module/alias/base lookups all miss; prefers
+     * an in-module match. Mirrors the C# short-name type fallback. */
+    if (depth == 0 && ctx->registry) {
+        const char *dot = strrchr(type_qn, '.');
+        const char *shortn = dot ? dot + 1 : type_qn;
+        size_t slen = strlen(shortn);
+        const char *best_qn = NULL;
+        for (int i = 0; i < ctx->registry->type_count; i++) {
+            const char *q = ctx->registry->types[i].qualified_name;
+            if (!q) {
+                continue;
+            }
+            size_t qlen = strlen(q);
+            if (qlen <= slen + 1 || q[qlen - slen - 1] != '.' ||
+                strcmp(q + qlen - slen, shortn) != 0) {
+                continue;
+            }
+            if (strcmp(q, type_qn) == 0) {
+                continue; // already tried as-is above
+            }
+            best_qn = q;
+            if (ctx->module_qn && strncmp(q, ctx->module_qn, strlen(ctx->module_qn)) == 0) {
+                break; // prefer a match in the current module
+            }
+        }
+        if (best_qn) {
+            f = c_lookup_member_depth(ctx, best_qn, member_name, depth + 1);
+            if (f) {
+                return f;
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -4204,8 +4251,15 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     if (ctx->enclosing_class_qn && saved_class_qn == ctx->enclosing_class_qn &&
         !strchr(func_qn, '.')) {
         func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn, func_qn);
-    } else if (ctx->module_qn && !strchr(func_qn, '.')) {
-        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, func_qn);
+    } else if (!strchr(func_qn, '.')) {
+        /* A free function in a namespace is qualified by the namespace scope
+         * (current_namespace is module_qn.ns), matching the def QN the extractor
+         * now produces; outside any namespace this falls back to the file module
+         * so non-namespaced free functions are unchanged. */
+        const char *scope = ctx->current_namespace ? ctx->current_namespace : ctx->module_qn;
+        if (scope) {
+            func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", scope, func_qn);
+        }
     }
     ctx->enclosing_func_qn = func_qn;
 
