@@ -1226,6 +1226,51 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
         store_set_error_sqlite(s, "upsert_project");
         return CBM_STORE_ERR;
     }
+
+    /* Store generation for cursor staleness (pagination): db_uid is a random
+     * identity minted once per DB FILE (a full reindex publishes a fresh file
+     * via the writer, which carries no store_meta — the first upsert_project
+     * on the opened store seeds a NEW uid, so cursors minted against the old
+     * file can never validate against the rebuilt one, whose node ids all
+     * differ). mutation_gen increments on every project upsert — the choke
+     * point every index run (full, incremental, watcher) passes through.
+     * Created here rather than in the byte-level writer: adding a table to
+     * its hand-built sqlite_master is rootpage surgery for zero benefit. */
+    (void)sqlite3_exec(s->db,
+                       "CREATE TABLE IF NOT EXISTS store_meta (k TEXT PRIMARY KEY, v TEXT);"
+                       "INSERT OR IGNORE INTO store_meta VALUES"
+                       "('db_uid', lower(hex(randomblob(8))));"
+                       "INSERT OR IGNORE INTO store_meta VALUES('mutation_gen','0');"
+                       "UPDATE store_meta SET v = CAST(CAST(v AS INTEGER)+1 AS TEXT) "
+                       "WHERE k='mutation_gen';",
+                       NULL, NULL, NULL);
+    return CBM_STORE_OK;
+}
+
+/* Opaque store generation for pagination cursors: "u<db_uid>g<mutation_gen>",
+ * or "legacy" when the DB predates store_meta (read-only opens never create
+ * it). A cursor whose embedded generation mismatches the store's current one
+ * is stale — the graph may have changed under it. */
+int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz) {
+    if (!s || !s->db || !buf || bufsz == 0) {
+        return CBM_STORE_ERR;
+    }
+    snprintf(buf, bufsz, "legacy");
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT (SELECT v FROM store_meta WHERE k='db_uid'),"
+                           "       (SELECT v FROM store_meta WHERE k='mutation_gen');",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK; /* pre-migration DB: stable "legacy" generation */
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *uid = (const char *)sqlite3_column_text(stmt, 0);
+        const char *gen = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (uid && gen) {
+            snprintf(buf, bufsz, "u%sg%s", uid, gen);
+        }
+    }
+    sqlite3_finalize(stmt);
     return CBM_STORE_OK;
 }
 
@@ -3474,9 +3519,12 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     int limit = params->limit > 0 ? params->limit : CBM_DEFAULT_SEARCH_LIMIT;
     int offset = params->offset;
     const char *name_col = has_degree_filter ? "name" : "n.name";
+    const char *id_col = has_degree_filter ? "id" : "n.id";
     char order_limit[CBM_SZ_128];
-    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s LIMIT %d OFFSET %d", name_col, limit,
-             offset);
+    /* (name, id) is a unique total order — names are non-unique, and without
+     * the tie-break offset pages are not contractually stable across calls. */
+    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s, %s LIMIT %d OFFSET %d", name_col,
+             id_col, limit, offset);
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
     /* Execute count query */
@@ -3565,19 +3613,34 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
                              int visited_count, const char *types_clause, const char **edge_types,
                              int edge_type_count, cbm_edge_info_t **out_edges,
                              int *out_edge_count) {
-    /* Build ID set: root + all visited */
-    char id_set[CBM_SZ_4K];
-    int ilen = snprintf(id_set, sizeof(id_set), "%lld", (long long)start_id);
-    if (ilen >= (int)sizeof(id_set)) {
-        ilen = (int)sizeof(id_set) - SKIP_ONE;
+    *out_edges = NULL;
+    *out_edge_count = 0;
+
+    /* Visited-ID set via a per-connection TEMP table. The previous approach
+     * interpolated the ids into a fixed 4KB SQL string: past ~1000 visited
+     * nodes the list was cut MID-NUMBER, the SQL failed to prepare, and every
+     * trace edge silently vanished (and a luckier cut could match an
+     * unrelated node). TEMP tables live in the connection's temp db, so this
+     * works on read-only query connections too. */
+    if (sqlite3_exec(s->db,
+                     "CREATE TEMP TABLE IF NOT EXISTS bfs_ids (id INTEGER PRIMARY KEY);"
+                     "DELETE FROM bfs_ids;",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK; /* best-effort: nodes without edges beat an error */
     }
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(s->db, "INSERT OR IGNORE INTO bfs_ids(id) VALUES (?1)", CBM_NOT_FOUND,
+                           &ins, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK;
+    }
+    sqlite3_bind_int64(ins, SKIP_ONE, start_id);
+    (void)sqlite3_step(ins);
     for (int i = 0; i < visited_count; i++) {
-        ilen += snprintf(id_set + ilen, sizeof(id_set) - (size_t)ilen, ",%lld",
-                         (long long)visited[i].node.id);
-        if (ilen >= (int)sizeof(id_set)) {
-            ilen = (int)sizeof(id_set) - SKIP_ONE;
-        }
+        sqlite3_reset(ins);
+        sqlite3_bind_int64(ins, SKIP_ONE, visited[i].node.id);
+        (void)sqlite3_step(ins);
     }
+    sqlite3_finalize(ins);
 
     char edge_sql[ST_SQL_BUF];
     snprintf(edge_sql, sizeof(edge_sql),
@@ -3585,9 +3648,10 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
              "FROM edges e "
              "JOIN nodes n1 ON n1.id = e.source_id "
              "JOIN nodes n2 ON n2.id = e.target_id "
-             "WHERE e.source_id IN (%s) AND e.target_id IN (%s) "
+             "WHERE e.source_id IN (SELECT id FROM bfs_ids) "
+             "AND e.target_id IN (SELECT id FROM bfs_ids) "
              "AND e.type IN (%s)",
-             id_set, id_set, types_clause);
+             types_clause);
 
     sqlite3_stmt *estmt = NULL;
     int rc = sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &estmt, NULL);
@@ -3708,7 +3772,9 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "JOIN nodes n ON n.id = bfs.node_id "
              "WHERE bfs.hop > 0 " /* exclude root at hop 0 (self via a loop still appears) */
              "GROUP BY n.id "
-             "ORDER BY hop "
+             /* (hop, id) is a unique total order — deterministic pagination
+              * watermarks and reproducible trace output depend on it. */
+             "ORDER BY hop, n.id "
              "LIMIT %d;",
              (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
 

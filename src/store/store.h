@@ -266,6 +266,11 @@ int cbm_store_checkpoint(cbm_store_t *s);
  * connection, in bytes; -1 = unlimited (SQLite default / pre-fix). */
 int64_t cbm_store_journal_size_limit(cbm_store_t *s);
 
+/* Opaque store generation for pagination-cursor staleness detection:
+ * "u<db_uid>g<mutation_gen>" — db_uid is minted per DB file, mutation_gen
+ * bumps on every index run. "legacy" for DBs predating store_meta. */
+int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
+
 /* Resolve the mmap_size pragma value applied to on-disk stores from the
  * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)
  * when the variable is unset, malformed, or partially numeric. Negative

@@ -13,7 +13,6 @@ enum {
     MCP_FIELD_SIZE = 1040,
     MCP_TIMEOUT_MS = 1000,
     MCP_HALF_SEC_US = 500000,
-    MCP_MAX_ROWS = 100,
     MCP_COL_2 = 2,
     MCP_COL_3 = 3,
     MCP_COL_4 = 4,
@@ -26,7 +25,8 @@ enum {
     MCP_DEFAULT_DEPTH = 3,
     MCP_DEFAULT_BFS_DEPTH = 2,
     MCP_DEFAULT_LIMIT = 10,
-    MCP_BFS_LIMIT = 100,
+    MCP_BFS_LIMIT = 100,      /* default per-direction trace budget (limit param raises) */
+    MCP_BFS_LIMIT_MAX = 5000, /* hard ceiling for the limit param (context-bomb guard) */
     MCP_N_DEFAULTS_2 = 2,
     MCP_URI_PREFIX = 7,      /* strlen("file://") */
     MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
@@ -337,11 +337,12 @@ static const tool_def_t TOOLS[] = {
      "COVERAGE: the response reports files that were NOT fully indexed — 'skipped' (not "
      "indexed at all: oversized/read/parse failures) and 'parse_partial' (indexed, but "
      "constructs inside the listed line ranges could not be parsed and MAY be missing from "
-     "the graph). Query the persisted signal any time via index_status or "
-     "structurally via query_graph(graph=\"missed\"). Both signals are best-effort: absence "
-     "of a flag is NOT a completeness guarantee; prefer grep inside flagged ranges. "
-     "Separately, 'excluded' + 'not_indexed_files' list what was deliberately NOT indexed "
-     "(gitignore/.cbmignore/skip-lists) — by design, not failures.",
+     "the graph). The embedded lists carry counts plus a FEW EXAMPLES only; the complete "
+     "lists are in the per-run 'logfile' (path in the response) and queryable any time via "
+     "index_status or structurally via query_graph(graph=\"missed\"). Both signals are "
+     "best-effort: absence of a flag is NOT a completeness guarantee; prefer grep inside "
+     "flagged ranges. Separately, 'excluded' + 'not_indexed_files' list what was "
+     "deliberately NOT indexed (gitignore/.cbmignore/skip-lists) — by design, not failures.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
      "\"mode\":{\"type\":\"string\","
@@ -402,13 +403,17 @@ static const tool_def_t TOOLS[] = {
      "detect the limit and paginate.\"},\"offset\":{\"type\":\"integer\",\"default\":0,"
      "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
      "increment offset by limit and re-call while has_more is true.\"},"
-     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"tree\",\"json\"],\"default\":\"toon\","
      "\"description\":\"Response encoding. toon (default): compact header+rows tables, "
      "~60% fewer tokens. json: legacy verbose per-node objects.\"},"
      "\"fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
      "\"Extra per-node property columns for toon output, e.g. complexity, cognitive, "
-     "signature, docstring, return_type, is_test, lines(int). Missing values emit as "
-     "empty cells.\"}},"
+     "signature, docstring, return_type, is_test, lines(int). Core row columns "
+     "(qn/label/file/lines/in/out) are always present — do not request them here. "
+     "Missing values emit as empty cells.\"},"
+     "\"detail\":{\"type\":\"string\",\"enum\":[\"ids\",\"default\"],\"default\":\"default\","
+     "\"description\":\"ids: bare qualified-name enumeration (one column) — cheapest form "
+     "for wide sweeps where per-row metadata is noise. default: full rows.\"}},"
      "\"required\":[\"project\"]}"},
 
     {"query_graph", "Query graph",
@@ -451,10 +456,18 @@ static const tool_def_t TOOLS[] = {
      "Use INSTEAD OF grep for callers, dependencies, impact analysis, or data flow tracing. "
      "RESPONSE: compact TOON tables — `callees[N]{qn,hop}:`/`callers[N]{qn,hop}:` headers then "
      "one row per reached node (hop = BFS distance); risk/test/args columns appear when the "
-     "matching flags are set. Pass format=\"json\" for legacy verbose objects.",
+     "matching flags are set. `truncated: true` means a direction hit the node budget — re-call "
+     "with a higher 'limit'. Pass format=\"json\" for legacy verbose objects.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
-     "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},\"mode\":{"
+     "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3},"
+     "\"limit\":{\"type\":\"integer\",\"default\":100,\"minimum\":1,\"maximum\":5000,"
+     "\"description\":\"Rows per page. callees_total/callers_total always carry the exact full "
+     "counts; when a page is truncated the response carries next — see cursor.\"},"
+     "\"cursor\":{\"type\":\"string\",\"description\":\"Resume token from a previous response's "
+     "'next' field. Pass it back with ALL other arguments identical to get the following page "
+     "with no duplicates. Cursors outlive nothing: after a reindex you get a stale_cursor error "
+     "— just re-run the original query.\"},\"mode\":{"
      "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\"],\"default\":"
      "\"calls\",\"description\":\"calls: follow CALLS edges. data_flow: follow CALLS+DATA_FLOWS "
      "with arg expressions. cross_service: follow HTTP_CALLS+ASYNC_CALLS+DATA_FLOWS through "
@@ -467,7 +480,7 @@ static const tool_def_t TOOLS[] = {
      "\"},\"include_tests\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Include test files in results. When false (default), test files are "
      "filtered out. When true, test nodes are included with a test column/marker.\"},"
-     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"tree\",\"json\"],\"default\":\"toon\","
      "\"description\":\"Response encoding. toon (default): compact header+rows tables. "
      "json: legacy verbose per-hop objects.\"}},"
      "\"required\":[\"function_name\",\"project\"]}"},
@@ -552,7 +565,10 @@ static const tool_def_t TOOLS[] = {
      "query_graph(graph=\"missed\"). The report also carries 'not_indexed' — files/dirs excluded "
      "BY DESIGN (gitignore/.cbmignore/skip-lists): deliberate and deterministic, not failures; "
      "change the ignore rules and re-index to include them.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"verbose\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include the git "
+     "context block (worktree/shadow path variants). Only needed when debugging where an index "
+     "lives — omitted by default to keep the status lean.\"}},\"required\":["
      "\"project\"]}"},
 
     {"check_index_coverage", "Check index coverage",
@@ -2012,6 +2028,8 @@ static char *verify_project_indexed(cbm_store_t *store, const char *project) {
     return NULL;
 }
 
+static bool sg_field_blocked(const char *f); /* internal-only fields, defined with search_graph */
+
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
@@ -2037,6 +2055,13 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, lbl, "count", schema.node_labels[i].count);
         yyjson_mut_val *props = yyjson_mut_arr(doc);
         for (int j = 0; j < schema.node_labels[i].property_count; j++) {
+            /* Internal similarity intermediates (fp/sp/bt) are blocked from every
+             * tool response — advertising them here invited agents to request
+             * fields the server then silently refuses. Filter them from the
+             * schema so it only describes obtainable properties. */
+            if (sg_field_blocked(schema.node_labels[i].properties[j])) {
+                continue;
+            }
             yyjson_mut_arr_add_str(doc, props, schema.node_labels[i].properties[j]);
         }
         yyjson_mut_obj_add_val(doc, lbl, "properties", props);
@@ -2276,7 +2301,9 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "WHERE n.project = ?2 "
         "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
-        "ORDER BY rank "
+        /* rank ties are common (boosted floats) — the id tie-break makes
+         * offset pages contractually stable across calls. */
+        "ORDER BY rank, n.id "
         "LIMIT ?3 OFFSET ?4";
 
     sqlite3_stmt *stmt = NULL;
@@ -2558,12 +2585,27 @@ static bool sg_field_blocked(const char *f) {
     return strcmp(f, "fp") == 0 || strcmp(f, "sp") == 0 || strcmp(f, "bt") == 0;
 }
 
+/* Core row columns every search result already carries. Requesting one as an
+ * extra `fields` entry used to emit a silent empty column (core values are
+ * node columns, never in the properties JSON) — field-eval agents burned a
+ * round-trip on exactly that. Drop them and teach instead. */
+static bool sg_field_is_core(const char *f) {
+    return strcmp(f, "qn") == 0 || strcmp(f, "qualified_name") == 0 || strcmp(f, "name") == 0 ||
+           strcmp(f, "label") == 0 || strcmp(f, "file") == 0 || strcmp(f, "file_path") == 0 ||
+           strcmp(f, "path") == 0 || strcmp(f, "lines") == 0 || strcmp(f, "in") == 0 ||
+           strcmp(f, "out") == 0;
+}
+
 /* Parse the `fields` argument (array of property names) into out[] as
  * pointers owned by the returned doc (caller frees the doc after emission).
- * Blocked internal fields are silently dropped. */
-static int sg_parse_fields(const char *args, const char *out[], int max_out,
-                           yyjson_doc **out_owner) {
+ * Blocked internal fields are silently dropped; core-column requests are
+ * dropped too and reported via *core_requested so the emitter can hint. */
+static int sg_parse_fields(const char *args, const char *out[], int max_out, yyjson_doc **out_owner,
+                           bool *core_requested) {
     *out_owner = NULL;
+    if (core_requested) {
+        *core_requested = false;
+    }
     yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
     yyjson_val *fv = args_root ? yyjson_obj_get(args_root, "fields") : NULL;
@@ -2579,7 +2621,16 @@ static int sg_parse_fields(const char *args, const char *out[], int max_out,
     yyjson_val *item;
     yyjson_arr_foreach(fv, idx, max, item) {
         const char *s = yyjson_get_str(item);
-        if (s && s[0] && !sg_field_blocked(s) && n < max_out) {
+        if (!s || !s[0] || sg_field_blocked(s)) {
+            continue;
+        }
+        if (sg_field_is_core(s)) {
+            if (core_requested) {
+                *core_requested = true;
+            }
+            continue;
+        }
+        if (n < max_out) {
             out[n++] = s;
         }
     }
@@ -2627,8 +2678,21 @@ static void sg_lines_str(char *out, size_t sz, int start, int end) {
 
 /* Emit the regex-path search results as a TOON table. */
 static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *out, int offset,
-                                     const char *const *fields, int nfields) {
+                                     const char *const *fields, int nfields, bool detail_ids) {
     cbm_toon_scalar_int(sb, "total", out->total);
+    if (detail_ids) {
+        /* ids tier: bare qn enumeration — for "list everything matching X"
+         * sweeps where per-row metadata is noise (LocAgent's fold tier). */
+        static const char *const id_cols[] = {"qn"};
+        cbm_toon_table_header(sb, "results", out->count, id_cols, 1);
+        for (int i = 0; i < out->count; i++) {
+            cbm_toon_row_begin(sb);
+            cbm_toon_cell_str(sb, out->results[i].node.qualified_name, true);
+            cbm_toon_row_end(sb);
+        }
+        cbm_toon_scalar_bool(sb, "has_more", out->total > offset + out->count);
+        return;
+    }
     const char *cols[6 + SG_MAX_EXTRA_FIELDS] = {"qn", "label", "file", "lines", "in", "out"};
     int ncols = 6;
     for (int f = 0; f < nfields; f++) {
@@ -2650,6 +2714,101 @@ static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *ou
         cbm_toon_row_end(sb);
     }
     cbm_toon_scalar_bool(sb, "has_more", out->total > offset + out->count);
+}
+
+/* ── Tree format (Phase-2 A/B candidate) ────────────────────────────
+ * Prefix-factored, file-grouped output: the shared (qn-prefix, file) pair is
+ * printed ONCE per group, rows beneath carry only the short name + data
+ * cells. The reconstruction rule (qn = group-prefix + "." + name) is stated
+ * once in the header so agents can copy exact join keys into follow-up
+ * calls. Research basis: HDT front-coding (prefix factoring), LocAgent tree
+ * ablation (tree > flat/DOT for LLM comprehension), Lost-in-Distance
+ * (related rows adjacent — grouping by module does exactly that). */
+
+/* qn-prefix = qualified_name minus its last '.'-segment. Returns length. */
+static size_t sg_qn_prefix_len(const char *qn) {
+    const char *last = qn ? strrchr(qn, '.') : NULL;
+    return last ? (size_t)(last - qn) : 0;
+}
+
+static int sg_cmp_by_qn(const void *pa, const void *pb) {
+    const cbm_search_result_t *a = (const cbm_search_result_t *)pa;
+    const cbm_search_result_t *b = (const cbm_search_result_t *)pb;
+    const char *qa = a->node.qualified_name ? a->node.qualified_name : "";
+    const char *qb = b->node.qualified_name ? b->node.qualified_name : "";
+    return strcmp(qa, qb);
+}
+
+static void emit_search_results_tree(cbm_sb_t *sb, cbm_search_output_t *out, int offset,
+                                     const char *const *fields, int nfields) {
+    char buf[CBM_SZ_512];
+    char extra_cols[CBM_SZ_256] = "";
+    for (int f = 0; f < nfields; f++) {
+        strncat(extra_cols, " ", sizeof(extra_cols) - strlen(extra_cols) - 1);
+        strncat(extra_cols, fields[f], sizeof(extra_cols) - strlen(extra_cols) - 1);
+    }
+    snprintf(buf, sizeof(buf),
+             "total: %d\nresults: %d  (rows: name label lines in out%s; "
+             "qn = group prefix + \".\" + name)\n",
+             out->total, out->count, extra_cols);
+    cbm_sb_append(sb, buf);
+    /* Sort by qn so same-prefix rows are adjacent (module clustering). */
+    if (out->count > 1) {
+        qsort(out->results, (size_t)out->count, sizeof(cbm_search_result_t), sg_cmp_by_qn);
+    }
+    char cur_group[CBM_SZ_1K] = "";
+    for (int i = 0; i < out->count; i++) {
+        const cbm_search_result_t *sr = &out->results[i];
+        const char *qn = sr->node.qualified_name ? sr->node.qualified_name : "";
+        const char *file = sr->node.file_path ? sr->node.file_path : "";
+        size_t plen = sg_qn_prefix_len(qn);
+        char group[CBM_SZ_1K];
+        snprintf(group, sizeof(group), "%.*s (%s)", (int)plen, qn, file);
+        if (strcmp(group, cur_group) != 0) {
+            snprintf(cur_group, sizeof(cur_group), "%s", group);
+            cbm_sb_append(sb, group);
+            cbm_sb_append(sb, ":\n");
+        }
+        const char *shortname = plen ? qn + plen + 1 : qn;
+        char lines[CBM_SZ_32];
+        sg_lines_str(lines, sizeof(lines), sr->node.start_line, sr->node.end_line);
+        char row[CBM_SZ_1K];
+        snprintf(row, sizeof(row), "  %s %s %s %d %d", shortname,
+                 sr->node.label ? sr->node.label : "", lines, sr->in_degree, sr->out_degree);
+        cbm_sb_append(sb, row);
+        /* Extra property columns (fields param), space-delimited; missing
+         * values emit as "-" so column positions stay stable. */
+        if (nfields > 0) {
+            yyjson_doc *pd = (sr->node.properties_json && sr->node.properties_json[0])
+                                 ? yyjson_read(sr->node.properties_json,
+                                               strlen(sr->node.properties_json), 0)
+                                 : NULL;
+            yyjson_val *pr = pd ? yyjson_doc_get_root(pd) : NULL;
+            for (int f = 0; f < nfields; f++) {
+                yyjson_val *v = (pr && yyjson_is_obj(pr)) ? yyjson_obj_get(pr, fields[f]) : NULL;
+                char cell[CBM_SZ_256];
+                if (v && yyjson_is_str(v)) {
+                    snprintf(cell, sizeof(cell), " %s", yyjson_get_str(v));
+                } else if (v && yyjson_is_int(v)) {
+                    snprintf(cell, sizeof(cell), " %lld", (long long)yyjson_get_int(v));
+                } else if (v && yyjson_is_real(v)) {
+                    snprintf(cell, sizeof(cell), " %.3g", yyjson_get_real(v));
+                } else if (v && yyjson_is_bool(v)) {
+                    snprintf(cell, sizeof(cell), " %s", yyjson_get_bool(v) ? "true" : "false");
+                } else {
+                    snprintf(cell, sizeof(cell), " -");
+                }
+                cbm_sb_append(sb, cell);
+            }
+            if (pd) {
+                yyjson_doc_free(pd);
+            }
+        }
+        cbm_sb_append(sb, "\n");
+    }
+    snprintf(buf, sizeof(buf), "has_more: %s\n",
+             out->total > offset + out->count ? "true" : "false");
+    cbm_sb_append(sb, buf);
 }
 
 /* Emit semantic vector-search results as a TOON table. */
@@ -2680,12 +2839,16 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     /* Response encoding: TOON tables by default (compact, header+rows).
      * format:"json" restores the legacy verbose per-node objects; nested
-     * neighbor lists (include_connected) need them, so they force JSON. */
+     * neighbor lists (include_connected) need them, so they force JSON.
+     * format:"tree" is the Phase-2 A/B candidate: rows grouped by
+     * (qn-prefix, file) with the shared prefix printed once. */
     char *format_arg = cbm_mcp_get_string_arg(args, "format");
     bool legacy_json = format_arg && strcmp(format_arg, "json") == 0;
+    bool tree_format = format_arg && strcmp(format_arg, "tree") == 0;
     free(format_arg);
     if (cbm_mcp_get_bool_arg(args, "include_connected")) {
         legacy_json = true;
+        tree_format = false;
     }
 
     /* BM25 path: if `query` is set, run FTS5 full-text search with ranking
@@ -2750,7 +2913,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (!legacy_json) {
         const char *fields[SG_MAX_EXTRA_FIELDS];
         yyjson_doc *fields_owner = NULL;
-        int nfields = sg_parse_fields(args, fields, SG_MAX_EXTRA_FIELDS, &fields_owner);
+        char *sg_detail = cbm_mcp_get_string_arg(args, "detail");
+        bool detail_ids = sg_detail && strcmp(sg_detail, "ids") == 0;
+        free(sg_detail);
+        bool core_fields_requested = false;
+        int nfields = sg_parse_fields(args, fields, SG_MAX_EXTRA_FIELDS, &fields_owner,
+                                      &core_fields_requested);
 
         cbm_vector_result_t *vresults = NULL;
         int vcount = 0;
@@ -2771,7 +2939,21 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_search_output_t tout = {0};
             if (!semantic_only) {
                 cbm_store_search(store, &params, &tout);
-                emit_search_results_toon(&sb, &tout, offset, fields, nfields);
+                /* Grouped tree output is THE default; the flat table remains
+                 * only for detail:"ids" (single column — nothing to group). */
+                (void)tree_format;
+                if (detail_ids) {
+                    emit_search_results_toon(&sb, &tout, offset, fields, nfields, detail_ids);
+                } else {
+                    emit_search_results_tree(&sb, &tout, offset, fields, nfields);
+                }
+                if (core_fields_requested) {
+                    cbm_toon_scalar_str(
+                        &sb, "hint",
+                        "some requested fields (file/name/qn/label/lines) are already core "
+                        "row columns and were skipped — `fields` is for extra property "
+                        "columns like complexity, cognitive, signature");
+                }
                 if (tout.total == 0) {
                     if (name_pattern && label) {
                         cbm_toon_scalar_str(&sb, "hint",
@@ -3569,6 +3751,10 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
+    /* The git context block (worktree/shadow path variants) only matters when
+     * debugging index-location issues — gate it so the common status call
+     * stays lean. */
+    bool verbose = cbm_mcp_get_bool_arg(args, "verbose");
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -3585,7 +3771,9 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         if (cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
-            add_git_context_json(doc, root, proj_info.root_path);
+            if (verbose) {
+                add_git_context_json(doc, root, proj_info.root_path);
+            }
             safe_str_free(&proj_info.name);
             safe_str_free(&proj_info.indexed_at);
             safe_str_free(&proj_info.root_path);
@@ -4620,6 +4808,18 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
     return best;
 }
 
+static int node_hop_cmp_hop_id(const void *pa, const void *pb) {
+    const cbm_node_hop_t *a = (const cbm_node_hop_t *)pa;
+    const cbm_node_hop_t *b = (const cbm_node_hop_t *)pb;
+    if (a->hop != b->hop) {
+        return a->hop < b->hop ? -1 : 1;
+    }
+    if (a->node.id != b->node.id) {
+        return a->node.id < b->node.id ? -1 : 1;
+    }
+    return 0;
+}
+
 /* BFS from EVERY node sharing the resolved name and merge the results, so the
  * caller/callee set is complete even when one logical symbol is represented by
  * more than one graph node — e.g. a real .ts implementation plus an ambient
@@ -4629,17 +4829,24 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
  * transfers into *out, freed by cbm_store_traverse_free. */
 static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
                                 const char *direction, const char **edge_types, int edge_type_count,
-                                int depth, cbm_traverse_result_t *out) {
+                                int depth, int limit, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
     int vcap = 0, ecap = 0;
     for (int k = 0; k < node_count; k++) {
         cbm_traverse_result_t tr = {0};
-        cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth,
-                      MCP_BFS_LIMIT, &tr);
+        cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth, limit,
+                      &tr);
         for (int i = 0; i < tr.visited_count; i++) {
             bool dup = false;
             for (int j = 0; j < out->visited_count; j++) {
                 if (out->visited[j].node.id == tr.visited[i].node.id) {
+                    /* Min-hop across seeds: keep-first recorded the EARLIER
+                     * seed's (possibly longer) distance; hop feeds risk_labels
+                     * and pagination watermarks, so it must match the
+                     * single-BFS MIN(hop) semantics (#797). */
+                    if (tr.visited[i].hop < out->visited[j].hop) {
+                        out->visited[j].hop = tr.visited[i].hop;
+                    }
                     dup = true;
                     break;
                 }
@@ -4655,6 +4862,20 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
             memset(&tr.visited[i], 0, sizeof(tr.visited[i])); /* ownership moved */
         }
         for (int i = 0; i < tr.edge_count; i++) {
+            /* Overlapping seed neighborhoods yield the same edge from more
+             * than one BFS — dedup by (source, target, type). */
+            bool edup = false;
+            for (int j = 0; j < out->edge_count; j++) {
+                if (out->edges[j].source_id == tr.edges[i].source_id &&
+                    out->edges[j].target_id == tr.edges[i].target_id && out->edges[j].type &&
+                    tr.edges[i].type && strcmp(out->edges[j].type, tr.edges[i].type) == 0) {
+                    edup = true;
+                    break;
+                }
+            }
+            if (edup) {
+                continue;
+            }
             if (out->edge_count >= ecap) {
                 ecap = ecap ? ecap * 2 : 8;
                 out->edges = safe_realloc(out->edges, ecap * sizeof(cbm_edge_info_t));
@@ -4663,6 +4884,166 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
             memset(&tr.edges[i], 0, sizeof(tr.edges[i])); /* ownership moved */
         }
         cbm_store_traverse_free(&tr); /* frees only the un-moved (root + dup) fields */
+    }
+    /* Canonical (hop, id) order — a pure function of the graph, independent of
+     * seed iteration order; required for deterministic output and watermarks. */
+    if (out->visited_count > 1) {
+        qsort(out->visited, (size_t)out->visited_count, sizeof(cbm_node_hop_t),
+              node_hop_cmp_hop_id);
+    }
+}
+
+/* ── Pagination cursors (stateless, exactly-once) ────────────────────
+ * Token: "c1.<leg>.<generation>.<qhash>.<hop>.<id>" — version, trace leg
+ * (o=callees, i=callers), the store generation (per-DB uid + mutation
+ * counter), an FNV-1a-64 hash of the canonical query params, and the
+ * (hop, node_id) watermark of the last emitted row in canonical order.
+ * Stateless by design: the server re-traverses (the recursive CTE pays the
+ * full reachable-set cost regardless of LIMIT, so a page costs what one
+ * call costs today) and skips to the watermark. The generation stamp turns
+ * every post-reindex cursor into a loud, actionable error — node ids are
+ * never reused across rebuilds, so silently resuming would be wrong. */
+
+static uint64_t cursor_fnv1a64(const char *s, uint64_t h) {
+    while (s && *s) {
+        h ^= (uint64_t)(unsigned char)*s++;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+typedef struct {
+    char leg;            /* 'o' callees, 'i' callers */
+    char generation[96]; /* store generation at mint time */
+    uint64_t qhash;      /* canonical-params hash */
+    int hop;             /* watermark: last emitted row */
+    int64_t node_id;
+} trace_cursor_t;
+
+/* Hash the params that define the traversal identity. A cursor replayed with
+ * different params must fail loudly, never silently mis-skip. */
+static uint64_t trace_params_hash(const char *project, const char *func_name, const char *direction,
+                                  const char *mode, int depth, bool include_tests, int limit) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h = cursor_fnv1a64(project ? project : "", h);
+    h = cursor_fnv1a64("|", h);
+    h = cursor_fnv1a64(func_name ? func_name : "", h);
+    h = cursor_fnv1a64("|", h);
+    h = cursor_fnv1a64(direction ? direction : "", h);
+    h = cursor_fnv1a64("|", h);
+    h = cursor_fnv1a64(mode ? mode : "", h);
+    char nums[64];
+    snprintf(nums, sizeof(nums), "|%d|%d|%d", depth, include_tests ? 1 : 0, limit);
+    h = cursor_fnv1a64(nums, h);
+    return h;
+}
+
+static void trace_cursor_encode(const trace_cursor_t *c, char *buf, size_t bufsz) {
+    snprintf(buf, bufsz, "c1.%c.%s.%016llx.%d.%lld", c->leg, c->generation,
+             (unsigned long long)c->qhash, c->hop, (long long)c->node_id);
+}
+
+/* Decode + validate. Returns NULL on success, else a static teaching error. */
+static const char *trace_cursor_decode(const char *token, const char *current_generation,
+                                       uint64_t expected_qhash, trace_cursor_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!token || strncmp(token, "c1.", 3) != 0) {
+        return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
+    }
+    const char *p = token + 3;
+    if (*p != 'o' && *p != 'i') {
+        return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
+    }
+    out->leg = *p;
+    p += 2; /* leg + '.' */
+    const char *gen_end = strchr(p, '.');
+    if (!gen_end || (size_t)(gen_end - p) >= sizeof(out->generation)) {
+        return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
+    }
+    memcpy(out->generation, p, (size_t)(gen_end - p));
+    out->generation[gen_end - p] = '\0';
+    unsigned long long qh = 0;
+    long long nid = 0;
+    if (sscanf(gen_end + 1, "%16llx.%d.%lld", &qh, &out->hop, &nid) != 3) {
+        return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
+    }
+    out->qhash = qh;
+    out->node_id = nid;
+    if (out->qhash != expected_qhash) {
+        return "cursor_params_mismatch: this cursor was issued for different arguments — "
+               "pass the cursor back with ALL other arguments identical";
+    }
+    if (strcmp(out->generation, current_generation) != 0) {
+        return "stale_cursor: the project was reindexed since this cursor was issued — "
+               "re-run the original query without 'cursor' (node identities changed)";
+    }
+    return NULL;
+}
+
+/* Slice a canonically-ordered traversal at the watermark: index of the first
+ * row strictly AFTER (hop, id). */
+static int trace_watermark_index(const cbm_traverse_result_t *tr, int hop, int64_t node_id) {
+    for (int i = 0; i < tr->visited_count; i++) {
+        if (tr->visited[i].hop > hop ||
+            (tr->visited[i].hop == hop && tr->visited[i].node.id > node_id)) {
+            return i;
+        }
+    }
+    return tr->visited_count;
+}
+
+/* Tree-format trace leg: rows grouped by qn-prefix (printed once), each row
+ * `name hop` — same data as the TOON table, prefix-factored. Test-file rows
+ * honor include_tests exactly like bfs_to_toon_table. Rows arrive in
+ * canonical (hop,id) order; grouping re-sorts by (prefix, hop, id) so
+ * same-module rows are adjacent (Lost-in-Distance) while hop stays visible. */
+static int tree_hop_cmp_qn(const void *pa, const void *pb) {
+    const cbm_node_hop_t *a = (const cbm_node_hop_t *)pa;
+    const cbm_node_hop_t *b = (const cbm_node_hop_t *)pb;
+    const char *qa = a->node.qualified_name ? a->node.qualified_name : "";
+    const char *qb = b->node.qualified_name ? b->node.qualified_name : "";
+    int c = strcmp(qa, qb);
+    if (c != 0) {
+        return c;
+    }
+    return a->hop - b->hop;
+}
+
+static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
+                              bool include_tests) {
+    int visible = 0;
+    for (int i = 0; i < tr->visited_count; i++) {
+        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+            continue;
+        }
+        visible++;
+    }
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf), "%s: %d  (rows: name hop; qn = group prefix + \".\" + name)\n", key,
+             visible);
+    cbm_sb_append(sb, buf);
+    if (tr->visited_count > 1) {
+        qsort(tr->visited, (size_t)tr->visited_count, sizeof(cbm_node_hop_t), tree_hop_cmp_qn);
+    }
+    char cur_group[CBM_SZ_1K] = "";
+    for (int i = 0; i < tr->visited_count; i++) {
+        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+            continue;
+        }
+        const char *qn =
+            tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "";
+        size_t plen = sg_qn_prefix_len(qn);
+        if (plen >= sizeof(cur_group)) {
+            plen = 0;
+        }
+        if (strncmp(cur_group, qn, plen) != 0 || cur_group[plen] != '\0') {
+            snprintf(cur_group, sizeof(cur_group), "%.*s", (int)plen, qn);
+            cbm_sb_append(sb, cur_group);
+            cbm_sb_append(sb, ":\n");
+        }
+        char row[CBM_SZ_512];
+        snprintf(row, sizeof(row), "  %s %d\n", plen ? qn + plen + 1 : qn, tr->visited[i].hop);
+        cbm_sb_append(sb, row);
     }
 }
 
@@ -4691,6 +5072,18 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH);
     depth = clamp_mcp_depth(depth, "trace_call_path");
+    /* Per-direction node budget for the BFS working set. The old fixed
+     * MCP_BFS_LIMIT silently truncated hub traces at 100 nodes with no
+     * signal; now the limit is a documented parameter and hitting it emits
+     * `truncated: true` (never a silent truncation — same policy as the
+     * depth clamp, #887). */
+    int trace_limit = cbm_mcp_get_int_arg(args, "limit", MCP_BFS_LIMIT);
+    if (trace_limit < 1) {
+        trace_limit = 1;
+    }
+    if (trace_limit > MCP_BFS_LIMIT_MAX) {
+        trace_limit = MCP_BFS_LIMIT_MAX;
+    }
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
 
@@ -4723,8 +5116,51 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
+    /* Pagination: decode + validate the resume cursor (if any) against the
+     * current store generation and the canonical params. Errors teach the
+     * recovery action instead of silently restarting from page 1. */
+    char generation[96];
+    (void)cbm_store_generation(store, generation, sizeof(generation));
+    char *cursor_arg = cbm_mcp_get_string_arg(args, "cursor");
+    trace_cursor_t cur = {0};
+    bool have_cursor = false;
+    if (cursor_arg && cursor_arg[0]) {
+        uint64_t qh =
+            trace_params_hash(project, func_name, direction ? direction : "both", mode,
+                              cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH), include_tests,
+                              cbm_mcp_get_int_arg(args, "limit", MCP_BFS_LIMIT));
+        const char *cerr = trace_cursor_decode(cursor_arg, generation, qh, &cur);
+        if (cerr) {
+            free(cursor_arg);
+            free(func_name);
+            free(project);
+            free(direction);
+            free(mode);
+            free(param_name);
+            return cbm_mcp_text_result(cerr, true);
+        }
+        have_cursor = true;
+    }
+    free(cursor_arg);
     if (!direction) {
         direction = heap_strdup("both");
+    }
+    /* Teaching error: an unknown direction used to silently produce an empty
+     * trace (both leg flags false) — a field-eval agent burned four calls on
+     * "callers"/"callees" before falling back to Cypher. */
+    if (strcmp(direction, "inbound") != 0 && strcmp(direction, "outbound") != 0 &&
+        strcmp(direction, "both") != 0) {
+        char errbuf[CBM_SZ_256];
+        snprintf(errbuf, sizeof(errbuf),
+                 "invalid direction \"%s\" — use \"inbound\" (callers), \"outbound\" (callees), "
+                 "or \"both\"",
+                 direction);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        free(param_name);
+        return cbm_mcp_text_result(errbuf, true);
     }
 
     /* Find the node by name. If the bare-name lookup misses, fall back to
@@ -4784,9 +5220,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Response encoding: TOON tables by default; format:"json" restores the
-     * legacy verbose per-hop objects. */
+     * legacy verbose per-hop objects; format:"tree" = Phase-2 A/B candidate
+     * (qn-prefix-grouped rows). */
     char *trace_format = cbm_mcp_get_string_arg(args, "format");
     bool trace_legacy_json = trace_format && strcmp(trace_format, "json") == 0;
+    bool trace_tree = trace_format && strcmp(trace_format, "tree") == 0;
     free(trace_format);
 
     /* Edge types: explicit > mode-based > default */
@@ -4807,14 +5245,79 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
 
     (void)sel; /* union across all same-name nodes — see bfs_union_same_name (#546) */
 
+    /* Traverse with the SAFETY ceiling (not the page size): the recursive CTE
+     * enumerates the full depth-bounded reachable set regardless of LIMIT, so
+     * materializing up to MCP_BFS_LIMIT_MAX rows costs the same traversal —
+     * and gives exact totals plus the rows every later page needs. The page
+     * size (trace_limit) only bounds what THIS response emits. */
     if (do_outbound) {
         bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
-                            depth, &tr_out);
+                            depth, MCP_BFS_LIMIT_MAX, &tr_out);
     }
     if (do_inbound) {
         bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count, depth,
-                            &tr_in);
+                            MCP_BFS_LIMIT_MAX, &tr_in);
     }
+
+    /* Page windows in canonical (hop,id) order. Legs drain in a fixed order
+     * (callees, then callers); a resume cursor starts its leg at the row
+     * after the watermark, and a page that finishes one leg with budget to
+     * spare continues into the next. */
+    int out_start = 0;
+    int in_start = 0;
+    if (have_cursor) {
+        if (cur.leg == 'o') {
+            out_start = trace_watermark_index(&tr_out, cur.hop, cur.node_id);
+        } else {
+            out_start = tr_out.visited_count; /* callees leg already drained */
+            in_start = trace_watermark_index(&tr_in, cur.hop, cur.node_id);
+        }
+    }
+    int budget = trace_limit;
+    int out_len = 0;
+    int in_len = 0;
+    if (do_outbound) {
+        out_len = tr_out.visited_count - out_start;
+        if (out_len > budget) {
+            out_len = budget;
+        }
+        budget -= out_len;
+    }
+    if (do_inbound) {
+        in_len = tr_in.visited_count - in_start;
+        if (in_len > budget) {
+            in_len = budget;
+        }
+    }
+    bool out_more = do_outbound && out_start + out_len < tr_out.visited_count;
+    bool in_more = do_inbound && in_start + in_len < tr_in.visited_count;
+    char next_tok[192] = "";
+    if (out_more || in_more) {
+        trace_cursor_t nc = {0};
+        snprintf(nc.generation, sizeof(nc.generation), "%s", generation);
+        nc.qhash = trace_params_hash(project, func_name, direction, mode, depth, include_tests,
+                                     trace_limit);
+        if (out_more) {
+            nc.leg = 'o';
+            nc.hop = tr_out.visited[out_start + out_len - 1].hop;
+            nc.node_id = tr_out.visited[out_start + out_len - 1].node.id;
+        } else {
+            nc.leg = 'i';
+            nc.hop = tr_in.visited[in_start + in_len - 1].hop;
+            nc.node_id = tr_in.visited[in_start + in_len - 1].node.id;
+        }
+        trace_cursor_encode(&nc, next_tok, sizeof(next_tok));
+    }
+
+    /* Window views: visited offset + count; the full edges array stays
+     * attached so data_flow args resolve for boundary nodes whose incoming
+     * edge originated on an earlier page. */
+    cbm_traverse_result_t view_out = tr_out;
+    view_out.visited += out_start;
+    view_out.visited_count = out_len;
+    cbm_traverse_result_t view_in = tr_in;
+    view_in.visited += in_start;
+    view_in.visited_count = in_len;
 
     char *json = NULL;
     if (!trace_legacy_json) {
@@ -4825,11 +5328,33 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (mode) {
             cbm_toon_scalar_str(&sb, "mode", mode);
         }
+        /* Grouped tree is THE default; risk_labels/data_flow keep the flat
+         * table (extra columns) in the same tree syntax. */
+        (void)trace_tree;
+        bool flat_trace = risk_labels || data_flow;
         if (do_outbound) {
-            bfs_to_toon_table(&sb, "callees", &tr_out, risk_labels, include_tests, data_flow);
+            cbm_toon_scalar_int(&sb, "callees_total", tr_out.visited_count);
+            if (flat_trace) {
+                bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow);
+            } else {
+                bfs_to_tree_table(&sb, "callees", &view_out, include_tests);
+            }
         }
         if (do_inbound) {
-            bfs_to_toon_table(&sb, "callers", &tr_in, risk_labels, include_tests, data_flow);
+            cbm_toon_scalar_int(&sb, "callers_total", tr_in.visited_count);
+            if (flat_trace) {
+                bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow);
+            } else {
+                bfs_to_tree_table(&sb, "callers", &view_in, include_tests);
+            }
+        }
+        if (next_tok[0]) {
+            cbm_toon_scalar_bool(&sb, "truncated", true);
+            cbm_toon_scalar_str(&sb, "next", next_tok);
+            cbm_toon_scalar_str(&sb, "hint",
+                                "more rows exist — re-call with cursor set to 'next' and ALL "
+                                "other arguments identical (no duplicates), or narrow with "
+                                "depth/edge_types");
         }
         json = cbm_sb_finish(&sb);
     } else {
@@ -4843,14 +5368,20 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);
         }
         if (do_outbound) {
+            yyjson_mut_obj_add_int(doc, root, "callees_total", tr_out.visited_count);
             yyjson_mut_obj_add_val(
                 doc, root, "callees",
-                bfs_to_json_array(doc, &tr_out, risk_labels, include_tests, data_flow));
+                bfs_to_json_array(doc, &view_out, risk_labels, include_tests, data_flow));
         }
         if (do_inbound) {
+            yyjson_mut_obj_add_int(doc, root, "callers_total", tr_in.visited_count);
             yyjson_mut_obj_add_val(
                 doc, root, "callers",
-                bfs_to_json_array(doc, &tr_in, risk_labels, include_tests, data_flow));
+                bfs_to_json_array(doc, &view_in, risk_labels, include_tests, data_flow));
+        }
+        if (next_tok[0]) {
+            yyjson_mut_obj_add_bool(doc, root, "truncated", true);
+            yyjson_mut_obj_add_strcpy(doc, root, "next_cursor", next_tok);
         }
         /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
         json = yy_doc_to_str(doc);
@@ -5029,7 +5560,7 @@ static void try_artifact_bootstrap(const char *project_name, const char *repo_pa
 /* Cap on excluded dir paths listed in the response — keep it compact on large
  * repos (node_modules / vendor / etc. can produce many skip points). The full
  * count is still reported via "count" + "truncated". */
-enum { INDEX_EXCLUDED_DIR_CAP = 25 };
+enum { INDEX_EXCLUDED_DIR_CAP = 5 }; /* examples only — see INDEX_SKIPPED_FILE_CAP note */
 
 /* Attach a compact summary of directory subtrees skipped during discovery (#411).
  * Shape: "excluded": {"dirs": [up to 25 rel-paths], "count": <total>, "truncated": <bool>}.
@@ -5056,7 +5587,12 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
 /* Cap on per-file skips embedded in the JSON response — keep it compact on
  * large repos. The FULL, uncapped list always goes to the per-run logfile;
  * the JSON carries "count" + "truncated" so nothing is silently hidden. */
-enum { INDEX_SKIPPED_FILE_CAP = 50 };
+/* In-response coverage lists are EXAMPLES, not the record: the full uncapped
+ * lists live in the per-run logfile (path in the same response) and are
+ * queryable via index_status (scope_limit) / query_graph(graph="missed").
+ * Five examples orient the agent; anything more duplicates the logfile into
+ * every index response (53 KB observed on a large repo). */
+enum { INDEX_SKIPPED_FILE_CAP = 5 };
 
 /* Attach the by-design ignored-FILES summary (#963 "purposely not indexed").
  * Individual files dropped by ignore rules — deliberate, not failures; whole
@@ -5086,10 +5622,8 @@ static void add_not_indexed_files_summary(yyjson_mut_doc *doc, yyjson_mut_val *r
     yyjson_mut_obj_add_int(doc, ni, "count", total);
     yyjson_mut_obj_add_bool(doc, ni, "truncated", total > shown);
     yyjson_mut_obj_add_str(doc, ni, "note",
-                           "Purposely not indexed — excluded BY DESIGN via "
-                           "gitignore/.cbmignore/skip-lists (see each file's reason). Not an "
-                           "error: change the ignore rules and re-index to include them. Whole "
-                           "excluded subtrees are listed separately under \"excluded\".");
+                           "Excluded by design (gitignore/.cbmignore/skip-lists); examples only — "
+                           "full list in 'logfile'.");
     yyjson_mut_obj_add_val(doc, root, "not_indexed_files", ni);
 }
 
@@ -5181,12 +5715,9 @@ static void add_parse_partial_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_int(doc, pp, "count", partials);
     yyjson_mut_obj_add_bool(doc, pp, "truncated", partials > INDEX_SKIPPED_FILE_CAP);
     yyjson_mut_obj_add_str(doc, pp, "note",
-                           "Best-effort signal, not a completeness guarantee: these files WERE "
-                           "indexed, but constructs inside the listed line ranges (1-based) could "
-                           "not be parsed and MAY be missing from the graph (tree-sitter error "
-                           "recovery still salvages some). Prefer text search (grep) for those "
-                           "regions. Files absent from this list are NOT guaranteed to be fully "
-                           "indexed. Query the persisted signal via index_status.");
+                           "Indexed, but constructs in these line ranges may be missing (best-"
+                           "effort signal); examples only — full list via index_status or "
+                           "'logfile'.");
     yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
 }
 

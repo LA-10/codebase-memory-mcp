@@ -580,6 +580,59 @@ TEST(integ_store_bfs_traversal) {
     PASS();
 }
 
+/* bfs_collect_edges built its visited-ID set into a fixed 4KB string: past
+ * ~340-1100 visited nodes (id-width dependent) the id list was SILENTLY cut,
+ * so trace edges (and data_flow args) vanished — and a partially-written id
+ * could even match an UNRELATED node, admitting wrong edges. GUARD: a star of
+ * 1200 callers (id string ≈ 4.6KB) must surface every edge. RED on the fixed
+ * buffer, GREEN with the temp-table join. */
+TEST(store_bfs_edges_survive_large_visited_set) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "star", "/tmp/star"), CBM_STORE_OK);
+
+    cbm_node_t hub = {0};
+    hub.project = "star";
+    hub.label = "Function";
+    hub.name = "hub";
+    hub.qualified_name = "star.hub";
+    hub.file_path = "hub.c";
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    ASSERT_GT(hub_id, 0);
+
+    enum { SPOKES = 1200 };
+    for (int i = 0; i < SPOKES; i++) {
+        char nm[32];
+        char qn[64];
+        snprintf(nm, sizeof(nm), "caller_%04d", i);
+        snprintf(qn, sizeof(qn), "star.caller_%04d", i);
+        cbm_node_t sp = {0};
+        sp.project = "star";
+        sp.label = "Function";
+        sp.name = nm;
+        sp.qualified_name = qn;
+        sp.file_path = "spokes.c";
+        int64_t sid = cbm_store_upsert_node(s, &sp);
+        ASSERT_GT(sid, 0);
+        cbm_edge_t e = {0};
+        e.project = "star";
+        e.source_id = sid;
+        e.target_id = hub_id;
+        e.type = "CALLS";
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0); /* returns the edge id */
+    }
+
+    cbm_traverse_result_t tr = {0};
+    ASSERT_EQ(cbm_store_bfs(s, hub_id, "inbound", NULL, 0, 1, SPOKES + 10, &tr), CBM_STORE_OK);
+    ASSERT_EQ(tr.visited_count, SPOKES);
+    /* Every caller->hub edge must be collected — none silently dropped. */
+    ASSERT_EQ(tr.edge_count, SPOKES);
+
+    cbm_store_traverse_free(&tr);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #411: index_repository silently drops entire subtrees with no record.
  * Moderate/fast mode applies FAST_SKIP_DIRS (tools/scripts/bin/docs/...) and ALL
  * modes apply ALWAYS_SKIP_DIRS (node_modules/...), so files are excluded from the
@@ -667,6 +720,7 @@ SUITE(integration) {
     RUN_TEST(integ_store_search_by_degree);
     RUN_TEST(integ_store_find_by_file);
     RUN_TEST(integ_store_bfs_traversal);
+    RUN_TEST(store_bfs_edges_survive_large_visited_set);
 
     /* Pipeline API tests (no db needed) */
     RUN_TEST(integ_pipeline_fqn_compute);

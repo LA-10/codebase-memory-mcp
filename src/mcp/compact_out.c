@@ -99,17 +99,17 @@ static bool looks_numeric(const char *s) {
 
 static bool needs_quotes(const char *s) {
     if (!s || !*s) {
-        return true; /* empty cell must be visible as "" */
-    }
-    if (isspace((unsigned char)s[0]) || isspace((unsigned char)s[strlen(s) - 1])) {
-        return true;
+        return false; /* empty cells emit as the "-" placeholder, not quotes */
     }
     for (const char *p = s; *p; p++) {
-        if (*p == ',' || *p == '"' || *p == '\n' || *p == '\r') {
+        /* Space-delimited rows: any internal whitespace or quote forces
+         * quoting so column positions stay parseable. */
+        if (isspace((unsigned char)*p) || *p == '"' || *p == '\r') {
             return true;
         }
     }
-    if (strcmp(s, "true") == 0 || strcmp(s, "false") == 0 || strcmp(s, "null") == 0) {
+    if (strcmp(s, "true") == 0 || strcmp(s, "false") == 0 || strcmp(s, "null") == 0 ||
+        strcmp(s, "-") == 0) {
         return true;
     }
     return looks_numeric(s);
@@ -140,6 +140,10 @@ static void append_quoted(cbm_sb_t *sb, const char *s) {
 }
 
 static void append_value(cbm_sb_t *sb, const char *s) {
+    if (!s || !*s) {
+        cbm_sb_append_n(sb, "-", 1); /* stable column positions for empties */
+        return;
+    }
     if (needs_quotes(s)) {
         append_quoted(sb, s);
     } else {
@@ -174,19 +178,19 @@ void cbm_toon_scalar_bool(cbm_sb_t *sb, const char *key, bool v) {
 
 /* ── Tables ─────────────────────────────────────────────────────── */
 
+/* Tree-syntax table header: `key: N  (cols: a b c)` — count first (agents
+ * read scale before rows), column names once, rows indented beneath. */
 void cbm_toon_table_header(cbm_sb_t *sb, const char *key, int n, const char *const *cols,
                            int ncols) {
     char num[32];
-    snprintf(num, sizeof(num), "[%d]{", n);
+    snprintf(num, sizeof(num), ": %d  (cols:", n);
     cbm_sb_append(sb, key);
     cbm_sb_append(sb, num);
     for (int i = 0; i < ncols; i++) {
-        if (i > 0) {
-            cbm_sb_append_n(sb, ",", 1);
-        }
+        cbm_sb_append_n(sb, " ", 1);
         cbm_sb_append(sb, cols[i]);
     }
-    cbm_sb_append_n(sb, "}:\n", 3);
+    cbm_sb_append_n(sb, ")\n", 2);
 }
 
 void cbm_toon_row_begin(cbm_sb_t *sb) {
@@ -195,7 +199,7 @@ void cbm_toon_row_begin(cbm_sb_t *sb) {
 
 void cbm_toon_cell_str(cbm_sb_t *sb, const char *val, bool first) {
     if (!first) {
-        cbm_sb_append_n(sb, ",", 1);
+        cbm_sb_append_n(sb, " ", 1);
     }
     append_value(sb, val ? val : "");
 }
@@ -204,7 +208,7 @@ void cbm_toon_cell_int(cbm_sb_t *sb, long long v, bool first) {
     char num[32];
     snprintf(num, sizeof(num), "%lld", v);
     if (!first) {
-        cbm_sb_append_n(sb, ",", 1);
+        cbm_sb_append_n(sb, " ", 1);
     }
     cbm_sb_append(sb, num);
 }
@@ -213,14 +217,14 @@ void cbm_toon_cell_real(cbm_sb_t *sb, double v, bool first) {
     char num[48];
     snprintf(num, sizeof(num), "%.4g", v);
     if (!first) {
-        cbm_sb_append_n(sb, ",", 1);
+        cbm_sb_append_n(sb, " ", 1);
     }
     cbm_sb_append(sb, num);
 }
 
 void cbm_toon_cell_bool(cbm_sb_t *sb, bool v, bool first) {
     if (!first) {
-        cbm_sb_append_n(sb, ",", 1);
+        cbm_sb_append_n(sb, " ", 1);
     }
     cbm_sb_append(sb, v ? "true" : "false");
 }
